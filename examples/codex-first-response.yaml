@@ -1,5 +1,11 @@
-# Merge this fragment into the existing CPA/Home configuration. Do not replace
+# For standalone CPA or a Home version whose schema accepts these keys,
+# merge this fragment into the existing configuration. Do not replace
 # the complete configuration or remove existing authentication/routing settings.
+# Home v1.1.7: keep the new keys out of Home; set these on the CPA container instead:
+#   CPA_CODEX_FIRST_RESPONSE_TIMEOUT: "30s"
+#   CPA_CODEX_FIRST_RESPONSE_ATTEMPT_TIMEOUT: "15s"
+#   CPA_CODEX_FIRST_RESPONSE_MAX_REQUEST_BYTES: "262144"
+# Nonempty variables override YAML across Home reloads; total "0" disables the policy.
 upstream:
   codex:
     # Shared pre-response budget for ordinary Codex HTTP streaming requests.

@@ -129,3 +129,61 @@ upstream: {codex: {first-response-timeout: "0"}}
 		t.Fatalf("explicit canonical disable was overridden: %v", got)
 	}
 }
+
+func TestCodexFirstResponseEnvironmentOverrides(t *testing.T) {
+	for _, tc := range []struct {
+		name, total, attempt, maxBytes string
+		wantTotal, wantAttempt         time.Duration
+		wantBytes                      int
+	}{
+		{"all overrides", "30s", "15s", "262144", 30 * time.Second, 15 * time.Second, 262144},
+		{"total clamps YAML attempt", "30s", "", "", 30 * time.Second, 30 * time.Second, 131072},
+		{"attempt only", "", "10s", "", 60 * time.Second, 10 * time.Second, 131072},
+		{"bytes only", "", "", "65536", 60 * time.Second, 40 * time.Second, 65536},
+		{"empty values use YAML", "", "", "", 60 * time.Second, 40 * time.Second, 131072},
+		{"blank values use YAML", "  ", "\t", " ", 60 * time.Second, 40 * time.Second, 131072},
+		{"explicit disable", "0", "15s", "", 0, 0, 131072},
+		{"invalid total disables", "later", "15s", "", 0, 0, 131072},
+		{"invalid attempt uses half", "", "later", "", 60 * time.Second, 30 * time.Second, 131072},
+		{"zero attempt uses half", "", "0", "", 60 * time.Second, 30 * time.Second, 131072},
+		{"invalid bytes use default", "", "", "later", 60 * time.Second, 40 * time.Second, 262144},
+		{"zero bytes use default", "", "", "0", 60 * time.Second, 40 * time.Second, 262144},
+		{"negative bytes use default", "", "", "-1", 60 * time.Second, 40 * time.Second, 262144},
+		{"overflow bytes use default", "", "", "9223372036854775808", 60 * time.Second, 40 * time.Second, 262144},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("CPA_CODEX_FIRST_RESPONSE_TIMEOUT", tc.total)
+			t.Setenv("CPA_CODEX_FIRST_RESPONSE_ATTEMPT_TIMEOUT", tc.attempt)
+			t.Setenv("CPA_CODEX_FIRST_RESPONSE_MAX_REQUEST_BYTES", tc.maxBytes)
+			cfg := &CodexConfig{FirstResponseTimeout: "60s", FirstResponseAttemptTimeout: "40s", FirstResponseMaxRequestBytes: 131072}
+			if total, attempt, limit := cfg.FirstResponseTimeoutDuration(), cfg.FirstResponseAttemptTimeoutDuration(), cfg.FirstResponseRequestByteLimit(); total != tc.wantTotal || attempt != tc.wantAttempt || limit != tc.wantBytes {
+				t.Fatalf("effective policy = (%v,%v,%d), want (%v,%v,%d)", total, attempt, limit, tc.wantTotal, tc.wantAttempt, tc.wantBytes)
+			}
+			if cfg.FirstResponseTimeout != "60s" || cfg.FirstResponseAttemptTimeout != "40s" || cfg.FirstResponseMaxRequestBytes != 131072 {
+				t.Fatal("environment overrides mutated persisted configuration")
+			}
+		})
+	}
+}
+
+func TestCodexFirstResponseEnvironmentSurvivesHomeSnapshotReload(t *testing.T) {
+	t.Setenv("CPA_CODEX_FIRST_RESPONSE_TIMEOUT", "30s")
+	t.Setenv("CPA_CODEX_FIRST_RESPONSE_ATTEMPT_TIMEOUT", "15s")
+	t.Setenv("CPA_CODEX_FIRST_RESPONSE_MAX_REQUEST_BYTES", "65536")
+	for _, raw := range []string{"{}", "codex: {stream-bootstrap-buffering: true}\n"} {
+		cfg, err := ParseConfigBytes([]byte(raw))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Codex.FirstResponseTimeoutDuration() != 30*time.Second || cfg.Codex.FirstResponseAttemptTimeoutDuration() != 15*time.Second || cfg.Codex.FirstResponseRequestByteLimit() != 65536 {
+			t.Fatal("Home snapshot without new fields lost node-local policy")
+		}
+		if cfg.Codex.FirstResponseTimeout != "" {
+			t.Fatal("environment policy leaked into raw Home configuration")
+		}
+	}
+	var absent *CodexConfig
+	if absent.FirstResponseTimeoutDuration() != 0 || absent.FirstResponseAttemptTimeoutDuration() != 0 || absent.FirstResponseRequestByteLimit() != 262144 {
+		t.Fatal("environment policy changed nil-config behavior")
+	}
+}
