@@ -441,6 +441,10 @@ upstream:
     # reasoning levels are excluded. Larger JSON payloads are excluded by the byte limit below.
     # Default: "0" (disabled). Example deployment: "30s" total with "15s" per attempt.
     # Invalid or non-positive total durations also disable this policy. Integers mean seconds.
+    # Node-local environment overrides (also survive Home config reloads):
+    # CPA_CODEX_FIRST_RESPONSE_TIMEOUT=30s, CPA_CODEX_FIRST_RESPONSE_ATTEMPT_TIMEOUT=15s,
+    # CPA_CODEX_FIRST_RESPONSE_MAX_REQUEST_BYTES=262144. Nonempty values override YAML.
+    # With Home v1.1.7, use these CPA-container variables instead of adding keys to Home's schema.
     first-response-timeout: "0"
     # Unset, invalid, or non-positive values use half the total; values above the total are capped.
     # Each attempt is also capped by the remaining shared budget, never a fresh total budget.
