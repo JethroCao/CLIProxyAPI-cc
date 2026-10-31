@@ -357,6 +357,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		return nil, nil, errChan
 	}
 	ctx = enrichContextWithSessionHierarchy(ctx, opts.Headers, req.Payload, opts.Metadata)
+	ctx = h.AuthManager.PrepareFirstResponseBudget(ctx)
 	streamResult, err := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
 	if err != nil {
 		err = enrichAuthSelectionError(err, providers, normalizedModel)
@@ -525,6 +526,9 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 	}
 
 	bootstrapEligible := func(err error) bool {
+		if coreexecutor.FirstResponseBudgetFromContext(ctx).Committed() {
+			return false
+		}
 		status := statusFromError(err)
 		if status == 0 {
 			return true

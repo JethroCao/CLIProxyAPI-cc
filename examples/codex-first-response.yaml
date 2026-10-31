@@ -1,0 +1,11 @@
+# Merge this fragment into the existing CPA/Home configuration. Do not replace
+# the complete configuration or remove existing authentication/routing settings.
+upstream:
+  codex:
+    # Shared pre-response budget for ordinary Codex HTTP streaming requests.
+    first-response-timeout: "30s"
+    # At most two attempts; the second uses only the remaining shared budget.
+    first-response-attempt-timeout: "15s"
+    # Larger finalized JSON bodies and deep/unknown reasoning are exempt.
+    # This is a conservative byte limit, not a token count.
+    first-response-max-request-bytes: 262144

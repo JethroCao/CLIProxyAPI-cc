@@ -543,11 +543,37 @@ func (r *UsageReporter) buildAdditionalModelRecord(model string, detail usage.De
 }
 
 func (r *UsageReporter) PublishFailure(ctx context.Context, errs ...error) {
-	r.publishWithOutcome(ctx, usage.Detail{}, true, failFromErrors(errs...))
+	r.PublishFailureWithDetail(ctx, usage.Detail{}, errs...)
 }
 
 func (r *UsageReporter) PublishFailureWithDetail(ctx context.Context, detail usage.Detail, errs ...error) {
-	r.publishWithOutcome(ctx, detail, true, failFromErrors(errs...))
+	if r == nil {
+		return
+	}
+	var outcome error
+	for _, err := range errs {
+		if err != nil {
+			outcome = err
+			break
+		}
+	}
+	detail = normalizeUsageDetailTotal(detail, r.provider, r.executorType)
+	r.once.Do(func() {
+		record := r.buildRecord(detail, true, failFromErrors(errs...))
+		if cliproxyexecutor.IsFirstResponsePolicyError(outcome) {
+			// Home v1.1.7 treats indexed 502/504 usage as credential failure,
+			// regardless of Fail.Code. Keep the failed request and account source
+			// observable, but omit its scheduler attribution for this local policy.
+			// Mutate the record copy, never the reporter's identity.
+			LogWithRequestID(ctx).
+				WithField("auth_index", record.AuthIndex).
+				WithField("execution_id", record.RequestID).
+				WithField("failure_code", record.Fail.Code).
+				Warn("first-response policy ended the attempt; usage does not change credential health")
+			record.AuthIndex = ""
+		}
+		r.publishAttemptRecord(ctx, record)
+	})
 }
 
 func (r *UsageReporter) TrackFailure(ctx context.Context, errPtr *error) {
@@ -726,6 +752,15 @@ func failFromErrors(errs ...error) usage.Failure {
 		fail := usage.Failure{
 			Body:       body,
 			StatusCode: clienterror.HTTPStatusFromError(err),
+		}
+		if timeoutErr, ok := errors.AsType[*cliproxyexecutor.FirstResponseTimeoutError](err); ok && timeoutErr != nil {
+			fail.Code = "first_response_attempt_timeout"
+			if timeoutErr.Final {
+				fail.Code = "first_response_timeout"
+			}
+		}
+		if bufferErr, ok := errors.AsType[*cliproxyexecutor.FirstResponseBufferLimitError](err); ok && bufferErr != nil {
+			fail.Code = "first_response_buffer_limit"
 		}
 		if truncatedErr, ok := errors.AsType[cliproxyexecutor.StreamTruncatedError](err); ok && truncatedErr != nil && truncatedErr.IsStreamTruncated() {
 			fail.Code = usage.FailureStreamTruncatedCode
