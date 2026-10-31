@@ -233,6 +233,7 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 // ExecuteStream performs a streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	ctx = m.PrepareFirstResponseBudget(ctx)
 	ctx = cliproxyexecutor.WithRequestProxyURL(ctx, opts.ProxyURL)
 	req, opts = cliproxysession.Enrich(req, opts)
 	if m.HomeEnabled() {
@@ -245,6 +246,9 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
 
+	if len(normalized) != 1 || !strings.EqualFold(normalized[0], "codex") {
+		cliproxyexecutor.FirstResponseBudgetFromContext(ctx).Disable()
+	}
 	defaultRequestRetry, maxRetryCredentials, maxWait := m.retrySettings()
 
 	var lastErr error
@@ -255,11 +259,17 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	retryRoundPending := false
 	retryRoundWaited := false
 	for {
+		if errBudget := checkFirstResponseBudget(ctx, lastErr); errBudget != nil {
+			return nil, unwrapExecutionBoundaryError(errBudget)
+		}
 		roundAttempted := make(map[string]struct{})
 		roundOpts := withAttemptedAuthTracker(opts, roundAttempted)
 		result, errStream := m.executeStreamMixedOnce(ctx, normalized, req, roundOpts, maxRetryCredentials, &homeRetryLimit, attempt, defaultRequestRetry)
 		if errStream == nil {
 			return result, nil
+		}
+		if errBudget := checkFirstResponseBudget(ctx, errStream); errBudget != nil {
+			return nil, unwrapExecutionBoundaryError(errBudget)
 		}
 		if hasUpstreamExecutionAttempt(errStream) {
 			preferredUpstreamErr = errStream
@@ -269,7 +279,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 				if retryRoundWaited {
 					return nil, unwrapExecutionBoundaryError(errStream)
 				}
-				if errWait := waitForCooldown(ctx, wait, maxWait); errWait != nil {
+				if errWait := waitForCooldownWithFirstResponseBudget(ctx, wait, maxWait); errWait != nil {
 					return nil, errWait
 				}
 				retryRoundWaited = true
@@ -286,7 +296,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		if !shouldRetry {
 			break
 		}
-		if errWait := waitForCooldown(ctx, wait, maxWait); errWait != nil {
+		if errWait := waitForCooldownWithFirstResponseBudget(ctx, wait, maxWait); errWait != nil {
 			return nil, errWait
 		}
 		attempt++
@@ -941,6 +951,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	var upstreamErr error
 	var roundTiming homeRetryRoundTiming
 	for {
+		if errBudget := checkFirstResponseBudget(ctx, lastErr); errBudget != nil {
+			return nil, errBudget
+		}
 		allowSameAuthRetry := homeMode && homeSameAuthRetryPending && lastHomeAuthID != "" && homeSameAuthRetries[lastHomeAuthID] == 0
 		if maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials && !allowSameAuthRetry {
 			if lastErr != nil {
@@ -966,7 +979,14 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		var provider string
 		var errPick error
 		if homeMode {
-			selection, errPick = m.pickHomeDispatchSelection(ctx, routeModel, pickOpts)
+			pickCtx, releasePick := firstResponseControlContext(ctx)
+			selection, errPick = m.pickHomeDispatchSelection(pickCtx, routeModel, pickOpts)
+			if errBudget := releasePick(); errBudget != nil {
+				if selection != nil {
+					selection.End("first_response_budget_exhausted")
+				}
+				return nil, errBudget
+			}
 			if selection != nil {
 				auth = selection.CloneAuthForRoute(routeModel)
 				executor = selection.Executor
@@ -995,6 +1015,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				selection.End("missing_execution_target")
 			}
 			return nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
+		}
+		if !strings.EqualFold(strings.TrimSpace(provider), "codex") {
+			cliproxyexecutor.FirstResponseBudgetFromContext(ctx).Disable()
 		}
 		if homeMode {
 			m.observeHomeRetryLimit(auth, selection, homeRetryLimit)
@@ -1096,10 +1119,18 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 		attempted[auth.ID] = struct{}{}
 		var errPrepare error
+		prepareCtx, releasePrepare := firstResponseControlContext(execCtx)
 		if selection != nil {
-			auth, errPrepare = m.prepareHomeRequestAuth(execCtx, executor, selection)
+			auth, errPrepare = m.prepareHomeRequestAuth(prepareCtx, executor, selection)
 		} else {
-			auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
+			auth, errPrepare = m.prepareRequestAuth(prepareCtx, executor, auth)
+		}
+		if errBudget := releasePrepare(); errBudget != nil {
+			releaseAttempt()
+			if selection != nil {
+				selection.End("first_response_budget_exhausted")
+			}
+			return nil, errBudget
 		}
 		if errPrepare != nil {
 			if selection != nil {
@@ -1213,6 +1244,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 			if errCtx := execCtx.Err(); errCtx != nil && ctx != nil && ctx.Err() != nil {
 				return nil, errCtx
+			}
+			if errBudget := checkFirstResponseBudget(ctx, errStream); errBudget != nil {
+				return nil, errBudget
 			}
 			action, okAction := matchRequestScopedErrorAction(auth, errStream, m.runtimeConfigSnapshot())
 			if okAction {

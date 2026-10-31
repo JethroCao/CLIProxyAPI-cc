@@ -430,6 +430,23 @@ upstream:
     # is applied, and buffering relies purely on the 48-frame and 1MB byte budget.
     # Default: "0" (unlimited)
     stream-bootstrap-timeout: "0"
+    # Opt-in total wait budget before an ordinary Codex HTTP request starts producing output.
+    # Shared across credential attempts; at most one credential switch is allowed by this policy.
+    # Unlike stream-bootstrap-timeout, expiry cancels the pending upstream attempt.
+    # It stops limiting the request once substantive output or a server-tool event starts;
+    # it never limits the duration of an already-started answer. WebSockets are unaffected.
+    # Eligibility is checked against the finalized upstream JSON after payload overrides:
+    # unset/none/minimal/low/medium reasoning is eligible; high/xhigh/max/ultra and unknown
+    # reasoning levels are excluded. Larger JSON payloads are excluded by the byte limit below.
+    # Default: "0" (disabled). Example deployment: "30s" total with "15s" per attempt.
+    # Invalid or non-positive total durations also disable this policy. Integers mean seconds.
+    first-response-timeout: "0"
+    # Unset, invalid, or non-positive values use half the total; values above the total are capped.
+    # Each attempt is also capped by the remaining shared budget, never a fresh total budget.
+    first-response-attempt-timeout: "15s"
+    # Maximum finalized request JSON size eligible for the policy (not an exact token count).
+    # Zero or negative values use the default 256 KiB. Requests above this size keep prior behavior.
+    first-response-max-request-bytes: 262144
     # When true, enable opt-in compatibility for orphan Codex delegation outputs.
     # Converts orphan function_call_output items from codex_app/create_thread and
     # codex_app/send_message_to_thread (which lack a valid call_id or matching function_call)

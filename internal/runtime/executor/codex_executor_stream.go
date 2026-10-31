@@ -101,6 +101,27 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	if err != nil {
 		return nil, err
 	}
+	// Eligibility is read only after the final payload rules have run. The
+	// request-scoped budget is shared by the conductor across credential retries.
+	var firstAttempt *cliproxyexecutor.FirstResponseAttempt
+	if budget := cliproxyexecutor.FirstResponseBudgetFromContext(ctx); budget != nil {
+		if e.cfg == nil || cliproxyexecutor.DownstreamWebsocket(ctx) || !helps.CodexFirstResponseEligible(upstreamBody, e.cfg.Codex.FirstResponseRequestByteLimit()) {
+			budget.Disable()
+		} else {
+			ctx, firstAttempt, err = budget.StartAttempt(ctx)
+			if err != nil {
+				return nil, err
+			}
+			httpReq = httpReq.WithContext(ctx)
+		}
+	}
+	attemptTransferred := false
+	defer func() {
+		if !attemptTransferred {
+			err = firstAttempt.Err(err)
+			firstAttempt.Close()
+		}
+	}()
 	reporter.SetTranslatedReasoningEffort(upstreamBody, to.String())
 	prepareHeaders := func(request *http.Request) {
 		applyCodexHeaders(request, auth, apiKey, true, e.cfg, opts.Headers)
@@ -129,10 +150,11 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 
 	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClientRoundTripOnly(httpClient)
-	buffering := e.cfg != nil && e.cfg.Codex.StreamBootstrapBuffering
+	strictFirstResponse := firstAttempt != nil
+	buffering := strictFirstResponse || (e.cfg != nil && e.cfg.Codex.StreamBootstrapBuffering)
 	var bootstrapTimeout time.Duration
 	var bootstrapStart time.Time
-	if buffering {
+	if buffering && !strictFirstResponse {
 		bootstrapTimeout = e.cfg.Codex.StreamBootstrapTimeoutDuration()
 	}
 	// Start the bootstrap clock at response headers, before decoding may read body bytes.
@@ -219,7 +241,15 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	if buffering {
 		for scanner.Scan() {
 			line := scanner.Bytes()
+			if errAttempt := firstAttempt.Err(nil); errAttempt != nil {
+				closeBootstrapBody()
+				return nil, errAttempt
+			}
 			if budgetExhausted {
+				if strictFirstResponse {
+					closeBootstrapBody()
+					return nil, &cliproxyexecutor.FirstResponseBufferLimitError{}
+				}
 				helps.LogWithRequestID(ctx).Debugf("codex executor: bootstrap %s exhausted after %d lines / %d bytes / %v, releasing stream without overload probing", exhaustedReason, bufferedFrames, bufferedBytes, nowCodexBootstrap().Sub(bootstrapStart))
 				initialChunks = nil
 				streamStarted = true
@@ -282,6 +312,12 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				if isCodexBootstrapBufferableEvent(eventType, data) {
 					isHandshake = true
 				}
+				// Content, tool-start and unknown events close the safe retry
+				// window even if a downstream translator emits no bytes for them.
+				if !isHandshake && !firstAttempt.Commit() {
+					closeBootstrapBody()
+					return nil, firstAttempt.Err(ctx.Err())
+				}
 				switch eventType {
 				case "response.output_item.done":
 					collectCodexOutputItemDone(data, outputItemsByIndex, &outputItemsFallback)
@@ -327,6 +363,10 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 					bufferedBytes += frameBytes
 					bufferedChunks = append(bufferedChunks, chunks...)
 					continue
+				}
+				if strictFirstResponse {
+					closeBootstrapBody()
+					return nil, &cliproxyexecutor.FirstResponseBufferLimitError{}
 				}
 				exhausted := "frame budget"
 				if timeoutReached {
@@ -413,8 +453,10 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			emittedCount++
 		}
 	}
+	attemptTransferred = true
 	go func() {
 		defer close(out)
+		defer firstAttempt.Close()
 		defer func() {
 			if errClose := httpResp.Body.Close(); errClose != nil {
 				log.Errorf("codex executor: close response body error: %v", errClose)

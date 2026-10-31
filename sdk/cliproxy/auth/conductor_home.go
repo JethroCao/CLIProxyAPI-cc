@@ -656,13 +656,17 @@ func (m *Manager) endHomeSelectionBeforeRedispatch(ctx context.Context, selectio
 			bound = cfg.CredentialConcurrency.WithDefaults().CPACancelBound
 		}
 	}
-	waitCtx := ctx
+	waitCtx, releaseBudgetWait := firstResponseControlContext(ctx)
 	if waitCtx == nil {
 		waitCtx = context.Background()
 	}
 	waitCtx, cancelWait := context.WithTimeout(waitCtx, bound)
 	defer cancelWait()
-	if errWait := ticket.Wait(waitCtx); errWait != nil {
+	errWait := ticket.Wait(waitCtx)
+	if errBudget := releaseBudgetWait(); errBudget != nil {
+		return errBudget
+	}
+	if errWait != nil {
 		return &Error{Code: "home_unavailable", Message: "Home did not acknowledge credential release: " + errWait.Error(), Retryable: true, HTTPStatus: http.StatusServiceUnavailable}
 	}
 	return nil

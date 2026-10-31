@@ -282,6 +282,15 @@ type CodexConfig struct {
 	// When set (e.g. "20s"), the stream is released once the time ceiling is reached, avoiding
 	// reverse-proxy timeouts (e.g. Nginx 60s proxy_read_timeout).
 	StreamBootstrapTimeout string `yaml:"stream-bootstrap-timeout,omitempty" json:"stream-bootstrap-timeout,omitempty"`
+	// FirstResponseTimeout bounds the shared pre-response wait across ordinary Codex HTTP attempts.
+	// Empty, zero, negative, or invalid durations disable the opt-in policy.
+	FirstResponseTimeout string `yaml:"first-response-timeout,omitempty" json:"first-response-timeout,omitempty"`
+	// FirstResponseAttemptTimeout bounds each attempt within FirstResponseTimeout.
+	// An unset or invalid value uses half the total; a larger value is capped by the total.
+	FirstResponseAttemptTimeout string `yaml:"first-response-attempt-timeout,omitempty" json:"first-response-attempt-timeout,omitempty"`
+	// FirstResponseMaxRequestBytes excludes larger finalized JSON requests from the first-response policy.
+	// Zero or negative values use 256 KiB. This is a byte bound, not a token estimate.
+	FirstResponseMaxRequestBytes int `yaml:"first-response-max-request-bytes,omitempty" json:"first-response-max-request-bytes,omitempty"`
 	// OrphanDelegationCompatibility enables opt-in compatibility for orphan Codex delegation outputs.
 	OrphanDelegationCompatibility bool `yaml:"orphan-delegation-compatibility" json:"orphan-delegation-compatibility"`
 	// ModelLevelCooling scopes Codex usage_limit_reached quota cooldowns to the requested model

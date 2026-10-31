@@ -231,6 +231,11 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 	if executor == nil {
 		return nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
 	}
+	if !strings.EqualFold(strings.TrimSpace(provider), "codex") {
+		// A mixed-provider route leaving Codex retains the destination's own
+		// execution policy; this feature only owns Codex HTTP response waits.
+		cliproxyexecutor.FirstResponseBudgetFromContext(ctx).Disable()
+	}
 	executor = executorForAuth(executor, auth)
 	ctx = contextWithRequestedModelAlias(ctx, opts, routeModel)
 	var lastErr error
@@ -265,6 +270,16 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		startStream := time.Now()
 		streamResult, errStream := executor.ExecuteStream(ctx, auth, execReq, execOpts)
 		errStream = markUpstreamExecutionAttemptFromContext(ctx, errStream)
+		if cliproxyexecutor.IsFirstResponsePolicyError(errStream) {
+			// A local latency/memory policy is not an upstream credential result.
+			// Leave the parent context alive so Home can release this selection
+			// before a safe pre-output timeout rotates to another credential.
+			warnLogUpstreamFailure(ctx, entry, provider, execModel, auth, time.Since(startStream), errStream)
+			return nil, errStream
+		}
+		if errCommitted, stop := m.committedFirstResponseFailure(ctx, auth, provider, resultModel, routeModel, execOpts, errStream, ephemeralResult, executionSeq); stop {
+			return nil, errCommitted
+		}
 		if hasUpstreamExecutionAttempt(errStream) {
 			upstreamErr = errStream
 		}
@@ -312,6 +327,12 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		}
 		streamResult, errStream = validateStreamResult(streamResult, errStream)
 		errStream = markUpstreamExecutionAttemptFromContext(ctx, errStream)
+		if cliproxyexecutor.IsFirstResponsePolicyError(errStream) {
+			return nil, errStream
+		}
+		if errCommitted, stop := m.committedFirstResponseFailure(ctx, auth, provider, resultModel, routeModel, execOpts, errStream, ephemeralResult, executionSeq); stop {
+			return nil, errCommitted
+		}
 		if errStream != nil {
 			rerr := resultErrorFromError(errStream)
 			action, okAction := matchRequestScopedErrorAction(auth, errStream, m.runtimeConfigSnapshot())
@@ -344,6 +365,14 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 
 		buffered, closed, bootstrapErr := readStreamBootstrap(ctx, streamResult.Chunks)
 		bootstrapErr = markUpstreamExecutionAttemptFromContext(ctx, bootstrapErr)
+		if cliproxyexecutor.IsFirstResponsePolicyError(bootstrapErr) {
+			discardStreamChunks(streamResult.Chunks)
+			return nil, bootstrapErr
+		}
+		if errCommitted, stop := m.committedFirstResponseFailure(ctx, auth, provider, resultModel, routeModel, execOpts, bootstrapErr, ephemeralResult, executionSeq); stop {
+			discardStreamChunks(streamResult.Chunks)
+			return nil, errCommitted
+		}
 		if hasUpstreamExecutionAttempt(bootstrapErr) {
 			upstreamErr = newStreamBootstrapError(bootstrapErr, streamResult.Headers)
 		}
@@ -399,6 +428,14 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				discardStreamChunks(streamResult.Chunks)
 				return nil, errCancel
 			}
+		}
+		if cliproxyexecutor.IsFirstResponsePolicyError(bootstrapErr) {
+			discardStreamChunks(streamResult.Chunks)
+			return nil, bootstrapErr
+		}
+		if errCommitted, stop := m.committedFirstResponseFailure(ctx, auth, provider, resultModel, routeModel, execOpts, bootstrapErr, ephemeralResult, executionSeq); stop {
+			discardStreamChunks(streamResult.Chunks)
+			return nil, errCommitted
 		}
 		if bootstrapErr != nil {
 			action, okAction := matchRequestScopedErrorAction(auth, bootstrapErr, m.runtimeConfigSnapshot())
@@ -470,7 +507,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			warnLogUpstreamFailure(ctx, entry, provider, execModel, auth, time.Since(startStream), emptyErr)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, RouteModel: routeModel, Success: false, Error: resultErrorFromError(emptyErr), Options: execOpts, CredentialVersion: auth.CredentialVersion, RegistrationEpoch: auth.RegistrationEpoch, ExecutionSeq: executionSeq}
 			m.recordExecutionResult(ctx, result, auth, ephemeralResult)
-			if idx < len(execModels)-1 {
+			if idx < len(execModels)-1 && !cliproxyexecutor.FirstResponseBudgetFromContext(ctx).Committed() {
 				lastErr = emptyErr
 				continue
 			}
