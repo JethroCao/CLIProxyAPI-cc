@@ -84,5 +84,5 @@ func (m *Manager) committedFirstResponseFailure(ctx context.Context, auth *Auth,
 	result.CredentialScope = isCredentialScopedError(err)
 	applyRequestScopedActionToResult(action, okAction, &result)
 	m.recordExecutionResult(ctx, result, auth, ephemeral)
-	return annotateTrustedRetryAfterByHint(err), true
+	return err, true
 }
